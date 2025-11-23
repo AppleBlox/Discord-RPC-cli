@@ -1,10 +1,33 @@
-use std::{process::exit, time::{SystemTime,UNIX_EPOCH, Duration}, thread};
+use std::{process::exit, time::{SystemTime,UNIX_EPOCH, Duration}, thread, io::{self, BufRead}};
 use clap::Parser;
 use discord_rich_presence::{activity::{self, Activity,Party,Secrets}, DiscordIpcClient, DiscordIpc};
 use colored::*;
 use user_idle::UserIdle;
+use serde::Deserialize;
 
 mod cli;
+
+#[derive(Deserialize, Debug)]
+struct RpcUpdate {
+    state: Option<String>,
+    details: Option<String>,
+    large_image: Option<String>,
+    large_text: Option<String>,
+    small_image: Option<String>,
+    small_text: Option<String>,
+    button_text_1: Option<String>,
+    button_url_1: Option<String>,
+    button_text_2: Option<String>,
+    button_url_2: Option<String>,
+    party_size: Option<[i32; 2]>,
+    party_id: Option<String>,
+    match_id: Option<String>,
+    join_id: Option<String>,
+    spectate_id: Option<String>,
+    enable_time: Option<bool>,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+}
 
 fn check_current_party_size(party_size: &str) -> String {
     if party_size != "__None"{
@@ -22,11 +45,165 @@ fn check_max_party_size(party_size: &str) -> String {
     }
 }
 
+fn build_activity_from_update(update: &RpcUpdate) -> Activity<'_> {
+    let mut activity = activity::Activity::new();
+
+    // Add state and details
+    if let Some(state) = &update.state {
+        activity = activity.state(state);
+    }
+    if let Some(details) = &update.details {
+        activity = activity.details(details);
+    }
+
+    // Build assets
+    let mut has_assets = false;
+    let mut assets = activity::Assets::new();
+    if let Some(large_image) = &update.large_image {
+        assets = assets.large_image(large_image);
+        has_assets = true;
+    }
+    if let Some(large_text) = &update.large_text {
+        assets = assets.large_text(large_text);
+        has_assets = true;
+    }
+    if let Some(small_image) = &update.small_image {
+        assets = assets.small_image(small_image);
+        has_assets = true;
+    }
+    if let Some(small_text) = &update.small_text {
+        assets = assets.small_text(small_text);
+        has_assets = true;
+    }
+    if has_assets {
+        activity = activity.assets(assets);
+    }
+
+    // Add buttons
+    if let (Some(text1), Some(url1)) = (&update.button_text_1, &update.button_url_1) {
+        if let (Some(text2), Some(url2)) = (&update.button_text_2, &update.button_url_2) {
+            activity = activity.buttons(vec![
+                activity::Button::new(text1, url1),
+                activity::Button::new(text2, url2),
+            ]);
+        } else {
+            activity = activity.buttons(vec![activity::Button::new(text1, url1)]);
+        }
+    }
+
+    // Add timestamps
+    if let Some(true) = update.enable_time {
+        let time_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        activity = activity.timestamps(activity::Timestamps::new().start(time_unix));
+    } else if let Some(start_time) = update.start_time {
+        activity = activity.timestamps(activity::Timestamps::new().start(start_time));
+    } else if let Some(end_time) = update.end_time {
+        activity = activity.timestamps(activity::Timestamps::new().end(end_time));
+    }
+
+    // Add party info
+    if let Some(party_size) = update.party_size {
+        let mut party = Party::new().size(party_size);
+        if let Some(party_id) = &update.party_id {
+            party = party.id(party_id);
+        }
+        activity = activity.party(party);
+    }
+
+    // Add secrets
+    if let Some(match_id) = &update.match_id {
+        let mut secrets = Secrets::new().r#match(match_id);
+        if let Some(join_id) = &update.join_id {
+            secrets = secrets.join(join_id);
+        }
+        if let Some(spectate_id) = &update.spectate_id {
+            secrets = secrets.spectate(spectate_id);
+        }
+        activity = activity.secrets(secrets);
+    }
+
+    activity
+}
+
 fn main() {
     let args = cli::Cli::parse();
     let afk_rpc = args.afk_rpc;
     let afk_after = args.afk_after;
     let afk_update = args.afk_update;
+    let update_mode = args.update_mode;
+
+    // Update mode: Read JSON from stdin and update RPC
+    if update_mode {
+        if args.clientid == "__None" {
+            println!("{}{}", "error: ".red().bold(), "Client ID is required for update mode");
+            exit(1);
+        }
+
+        let mut client = DiscordIpcClient::new(&args.clientid).expect("Failed to create client");
+
+        match client.connect() {
+            Ok(_) => {
+                if !args.disable_color {
+                    println!("{}", "Client connected to Discord successfully.".green());
+                    println!("{}", "Update mode enabled. Send JSON objects via stdin to update RPC.".cyan());
+                    println!("{}", "Press Ctrl+C to exit.".cyan());
+                } else {
+                    println!("Client connected to Discord successfully.");
+                    println!("Update mode enabled. Send JSON objects via stdin to update RPC.");
+                    println!("Press Ctrl+C to exit.");
+                }
+            },
+            Err(_) => {
+                println!("Client failed to connect to Discord. Please try again or relaunch Discord.");
+                exit(1);
+            },
+        }
+
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(json_str) => {
+                    match serde_json::from_str::<RpcUpdate>(&json_str) {
+                        Ok(update) => {
+                            let activity = build_activity_from_update(&update);
+                            match client.set_activity(activity) {
+                                Ok(_) => {
+                                    if !args.disable_color {
+                                        println!("{}", "Activity updated successfully.".green());
+                                    } else {
+                                        println!("Activity updated successfully.");
+                                    }
+                                },
+                                Err(e) => {
+                                    if !args.disable_color {
+                                        println!("{}{}", "error: ".red().bold(), format!("Failed to update activity: {}", e));
+                                    } else {
+                                        println!("error: Failed to update activity: {}", e);
+                                    }
+                                },
+                            }
+                        },
+                        Err(e) => {
+                            if !args.disable_color {
+                                println!("{}{}", "error: ".red().bold(), format!("Failed to parse JSON: {}", e));
+                            } else {
+                                println!("error: Failed to parse JSON: {}", e);
+                            }
+                        },
+                    }
+                },
+                Err(e) => {
+                    if !args.disable_color {
+                        println!("{}{}", "error: ".red().bold(), format!("Failed to read from stdin: {}", e));
+                    } else {
+                        println!("error: Failed to read from stdin: {}", e);
+                    }
+                    break;
+                },
+            }
+        }
+        return;
+    }
 
     if !afk_rpc {
     let mut client = DiscordIpcClient::new(&args.clientid).expect("Failed to create client");

@@ -73,4 +73,7 @@ pub(crate) struct Cli {
 
     #[clap(short = 'C', long = "disable_color",help = "Whether to disable colors or not (optional)",display_order=24)]
     pub disable_color: bool,
+
+    #[clap(short = 'w', long = "update",help = "Enable update mode to read JSON from stdin and update RPC dynamically (optional)",display_order=25)]
+    pub update_mode: bool,
 }
